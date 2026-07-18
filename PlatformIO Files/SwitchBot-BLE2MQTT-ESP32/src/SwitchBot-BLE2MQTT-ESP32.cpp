@@ -335,6 +335,9 @@
 #include <Update.h>
 #include <CRC32.h>
 #include <ArduinoQueue.h>
+#include <map>
+#include <string>
+
 
 /*
   MIGRATION 2026-07:
