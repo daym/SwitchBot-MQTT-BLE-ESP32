@@ -336,6 +336,16 @@
 #include <CRC32.h>
 #include <ArduinoQueue.h>
 
+/*
+  MIGRATION 2026-07:
+  - Target board/package: ESP32 Dev Module with esp32 core 3.3.10.
+  - ArduinoJson 7.4.3: active StaticJsonDocument<N> declarations below were
+    converted to JsonDocument. Old pattern: StaticJsonDocument<100> doc;
+  - NimBLE-Arduino 2.5.0: scan callbacks, scan durations, client callbacks,
+    client counting, TX power, and const scan result pointers were updated.
+  - CRC32 2.0.1 did not require a code-level API change here.
+*/
+
 /****************** CONFIGURATIONS TO CHANGE *******************/
 
 /********** REQUIRED SETTINGS TO CHANGE **********/
@@ -665,9 +675,22 @@ static int ledONValue = HIGH;
 static int ledOFFValue = LOW;
 static bool isActiveScan = true;
 static bool isMeshNode = false;
-void scanEndedCB(NimBLEScanResults results);
-void rescanEndedCB(NimBLEScanResults results);
-void initialScanEndedCB(NimBLEScanResults results);
+// MIGRATION 2026-07: NimBLE-Arduino 2.5.0 moved scan end callbacks from start()
+// to NimBLEScanCallbacks::onScanEnd() and passes results by const reference plus a reason.
+enum ScanEndHandler {
+  SCAN_END_NONE,
+  SCAN_END_SCAN,
+  SCAN_END_RESCAN,
+  SCAN_END_INITIAL,
+  SCAN_END_FOREVER
+};
+void scanEndedCB(const NimBLEScanResults& results, int reason);
+void rescanEndedCB(const NimBLEScanResults& results, int reason);
+void initialScanEndedCB(const NimBLEScanResults& results, int reason);
+void scanForeverEnded(const NimBLEScanResults& results, int reason);
+void dispatchScanEnded(const NimBLEScanResults& results, int reason);
+void stopScanAndDispatchEnd();
+bool startScanSeconds(uint32_t seconds, ScanEndHandler handler, bool isContinue = true);
 bool isBotDevice(std::string aDevice);
 bool isPlugDevice(std::string aDevice);
 bool isMeterDevice(std::string & aDevice);
@@ -680,10 +703,12 @@ void recurringMeterScan();
 uint32_t getPassCRC(std::string & aDevice);
 bool is_number(const std::string & s);
 bool controlMQTT(std::string & device, std::string payload, bool disconnectAfter);
-bool sendCommand(NimBLEAdvertisedDevice * advDeviceToUse, const char * type, int attempts, bool disconnectAfter);
-bool sendToDevice(NimBLEAdvertisedDevice * advDevice, std::string & aName, const char * command, std::string & deviceTopic, bool disconnectAfter);
-bool requestInfo(NimBLEAdvertisedDevice * advDeviceToUse);
-bool connectToServer(NimBLEAdvertisedDevice * advDeviceToUse);
+// MIGRATION 2026-07: NimBLEScanCallbacks::onResult() now provides const devices.
+// Old signatures used NimBLEAdvertisedDevice*.
+bool sendCommand(const NimBLEAdvertisedDevice * advDeviceToUse, const char * type, int attempts, bool disconnectAfter);
+bool sendToDevice(const NimBLEAdvertisedDevice * advDevice, std::string & aName, const char * command, std::string & deviceTopic, bool disconnectAfter);
+bool requestInfo(const NimBLEAdvertisedDevice * advDeviceToUse);
+bool connectToServer(const NimBLEAdvertisedDevice * advDeviceToUse);
 void rescanMQTT(std::string & payload);
 void requestInfoMQTT(std::string & payload);
 void recurringScan();
@@ -694,8 +719,10 @@ bool shouldMQTTUpdateForDevice(std::string & anAddr);
 bool shouldMQTTUpdateOrActiveScanForDevice(std::string & anAddr);
 bool shouldActiveScanForDevice(std::string & anAddr);
 void processAdvData(std::string & deviceMac, long anRSSI,  std::string & aValueString, bool useActiveScan);
-static std::map<std::string, NimBLEAdvertisedDevice*> allSwitchbotsDev = {};
-static std::map<std::string, NimBLEAdvertisedDevice*> allSwitchbotsScanned = {};
+// MIGRATION 2026-07: NimBLE-Arduino 2.5.0 scan result devices are const.
+// Old type: std::map<std::string, NimBLEAdvertisedDevice*>
+static std::map<std::string, const NimBLEAdvertisedDevice*> allSwitchbotsDev = {};
+static std::map<std::string, const NimBLEAdvertisedDevice*> allSwitchbotsScanned = {};
 static std::map<std::string, unsigned long> rescanTimes = {};
 static std::map<std::string, unsigned long> lastUpdateTimes = {};
 static std::map<std::string, unsigned long> lastActiveScanTimes = {};
@@ -762,6 +789,9 @@ static std::map<std::string, std::string> lastCommandSentStrings = {};
 static std::map<std::string, std::string> allSwitchbots;
 static std::map<std::string, std::string> allSwitchbotsOpp;
 static std::map<std::string, bool> discoveredDevices = {};
+// MIGRATION 2026-07: NimBLEDevice::addIgnored() was removed in NimBLE-Arduino 2.x.
+// Keep the old behavior locally for unknown BLE addresses.
+static std::map<std::string, bool> ignoredDevices = {};
 static std::map<std::string, bool> botsInPressMode = {};
 static std::map<std::string, bool> botsToWaitFor = {};
 static std::map<std::string, int> botHoldSecs = {};
@@ -771,6 +801,7 @@ static std::map<std::string, bool> botInverteds = {};
 static std::map<std::string, unsigned long> lastCommandSent = {};
 static std::map<std::string, std::string> deviceTypes;
 static NimBLEScan* pScan;
+static ScanEndHandler pendingScanEndHandler = SCAN_END_NONE;
 static bool isRescanning = false;
 static bool processing = false;
 static bool initialScanComplete = false;
@@ -805,6 +836,72 @@ static const std::string setModeStdStr = ESPMQTTTopic + "/setMode";
 static const std::string setHoldStdStr = ESPMQTTTopic + "/setHold";
 static const std::string holdPressStdStr = ESPMQTTTopic + "/holdPress";
 //static StaticJsonDocument<120> aJsonDoc;
+
+// MIGRATION 2026-07: NimBLE-Arduino 2.5.0 expects scan durations in milliseconds
+// and no longer accepts the end callback in NimBLEScan::start().
+uint32_t scanSecondsToMillis(uint32_t seconds) {
+  if (seconds == 0) {
+    return 0;
+  }
+  if (seconds > (UINT32_MAX / 1000UL)) {
+    return UINT32_MAX;
+  }
+  return seconds * 1000UL;
+}
+
+void dispatchScanEnded(const NimBLEScanResults& results, int reason) {
+  ScanEndHandler handler = pendingScanEndHandler;
+  pendingScanEndHandler = SCAN_END_NONE;
+
+  switch (handler) {
+    case SCAN_END_SCAN:
+      scanEndedCB(results, reason);
+      break;
+    case SCAN_END_RESCAN:
+      rescanEndedCB(results, reason);
+      break;
+    case SCAN_END_INITIAL:
+      initialScanEndedCB(results, reason);
+      break;
+    case SCAN_END_FOREVER:
+      scanForeverEnded(results, reason);
+      break;
+    case SCAN_END_NONE:
+    default:
+      break;
+  }
+}
+
+bool startScanSeconds(uint32_t seconds, ScanEndHandler handler, bool isContinue) {
+  pendingScanEndHandler = handler;
+  bool started = pScan->start(scanSecondsToMillis(seconds), isContinue, true);
+  if (!started) {
+    pendingScanEndHandler = SCAN_END_NONE;
+  }
+  return started;
+}
+
+void stopScanAndDispatchEnd() {
+  if (pScan == nullptr) {
+    return;
+  }
+  if (pScan->isScanning()) {
+    pScan->stop();
+  }
+  NimBLEScanResults results = pScan->getResults();
+  dispatchScanEnded(results, 0);
+}
+
+// MIGRATION 2026-07: NimBLEAddress string constructors in NimBLE-Arduino 2.x
+// require an address type. Prefer the actual scanned address type; fall back
+// to type 1 because the original sketch used it for configured SwitchBot MACs.
+NimBLEAddress configuredSwitchBotAddress(const std::string& address) {
+  std::map<std::string, const NimBLEAdvertisedDevice*>::iterator it = allSwitchbotsDev.find(address);
+  if (it != allSwitchbotsDev.end() && it->second != nullptr) {
+    return it->second->getAddress();
+  }
+  return NimBLEAddress(address, 1);
+}
 
 struct to_lower {
   int operator() ( int ch )
@@ -2745,7 +2842,7 @@ void processAdvData(std::string & deviceMac, long anRSSI,  std::string & aValueS
 
   int aLength = aValueString.length();
   if (deviceName == botName) {
-    StaticJsonDocument<200> aJsonDoc;
+    JsonDocument aJsonDoc;
     char aBuffer[200];
 
     uint8_t byte1 = (uint8_t) aValueString[1];
@@ -2827,7 +2924,7 @@ void processAdvData(std::string & deviceMac, long anRSSI,  std::string & aValueS
     }
   }
   else if (deviceName == meterName) {
-    StaticJsonDocument<200> aJsonDoc;
+    JsonDocument aJsonDoc;
     char aBuffer[200];
 
     deviceStateTopic = meterTopic + aDevice + "/state";
@@ -2942,7 +3039,7 @@ void processAdvData(std::string & deviceMac, long anRSSI,  std::string & aValueS
 
   else if (deviceName == curtainName) {
 
-    StaticJsonDocument<200> aJsonDoc;
+    JsonDocument aJsonDoc;
     char aBuffer[200];
     processCurtainBattery(aDevice, deviceMac, aValueString, useActiveScan, shouldPublish, aJsonDoc);
     processCurtainRSSI(aDevice, deviceMac, anRSSI, useActiveScan, shouldPublish, aJsonDoc);
@@ -3020,7 +3117,7 @@ void processAdvData(std::string & deviceMac, long anRSSI,  std::string & aValueS
         addToPublish(deviceAttrTopic.c_str(), aBuffer, true);
         delay(50);
         addToPublish(deviceStateTopic.c_str(), aState.c_str(), true);
-        StaticJsonDocument<50> docPos;
+        JsonDocument docPos;
         docPos["pos"] = currentPosition;
         serializeJson(docPos, aBuffer);
         addToPublish(devicePosTopic.c_str(), aBuffer, true);
@@ -3030,7 +3127,7 @@ void processAdvData(std::string & deviceMac, long anRSSI,  std::string & aValueS
   }
 
   else if (deviceName == plugName) {
-    StaticJsonDocument<200> aJsonDoc;
+    JsonDocument aJsonDoc;
     char aBuffer[200];
 
     deviceStateTopic = plugTopic + aDevice + "/state";
@@ -3675,15 +3772,17 @@ void publishHomeAssistantDiscoveryMotionConfig(std::string & deviceName, std::st
 
 class ClientCallbacks : public NimBLEClientCallbacks {
 
-    void onConnect(NimBLEClient* pClient) {
+    void onConnect(NimBLEClient* pClient) override {
       printAString("Connected");
       pClient->updateConnParams(120, 120, 0, 60);
     };
 
-    void onDisconnect(NimBLEClient* pClient) {
+    // MIGRATION 2026-07: NimBLE-Arduino 2.5.0 adds a disconnect reason parameter.
+    // Old signature: void onDisconnect(NimBLEClient* pClient)
+    void onDisconnect(NimBLEClient* pClient, int reason) override {
     };
 
-    bool onConnParamsUpdateRequest(NimBLEClient* pClient, const ble_gap_upd_params* params) {
+    bool onConnParamsUpdateRequest(NimBLEClient* pClient, const ble_gap_upd_params* params) override {
       if (params->itvl_min < 24) { /** 1.25ms units */
         return false;
       } else if (params->itvl_max > 40) { /** 1.25ms units */
@@ -3697,23 +3796,34 @@ class ClientCallbacks : public NimBLEClientCallbacks {
       return true;
     };
 
-    uint32_t onPassKeyRequest() {
+    // MIGRATION 2026-07: onPassKeyRequest() was replaced by onPassKeyEntry().
+    // Old code:
+    // uint32_t onPassKeyRequest() { return 123456; }
+    void onPassKeyEntry(NimBLEConnInfo& connInfo) override {
       printAString("Client Passkey Request");
-      return 123456;
+      NimBLEDevice::injectPassKey(connInfo, 123456);
     };
 
-    bool onConfirmPIN(uint32_t pass_key) {
+    // MIGRATION 2026-07: onConfirmPIN() was replaced by onConfirmPasskey().
+    // Old code returned true from onConfirmPIN(uint32_t pass_key).
+    void onConfirmPasskey(NimBLEConnInfo& connInfo, uint32_t pass_key) override {
       printAString("The passkey YES/NO number: ");
       printAString(pass_key);
-      return true;
+      NimBLEDevice::injectConfirmPasskey(connInfo, true);
     };
 
-    void onAuthenticationComplete(ble_gap_conn_desc* desc) {
-      if (!desc->sec_state.encrypted) {
+    // MIGRATION 2026-07: ble_gap_conn_desc* was replaced by NimBLEConnInfo&.
+    // Old signature: void onAuthenticationComplete(ble_gap_conn_desc* desc)
+    void onAuthenticationComplete(NimBLEConnInfo& connInfo) override {
+      if (!connInfo.isEncrypted()) {
 
         printAString("Encrypt connection failed - disconnecting");
 
-        NimBLEDevice::getClientByID(desc->conn_handle)->disconnect();
+        // MIGRATION 2026-07: getClientByID() was renamed to getClientByHandle().
+        NimBLEClient* pClient = NimBLEDevice::getClientByHandle(connInfo.getConnHandle());
+        if (pClient) {
+          pClient->disconnect();
+        }
         return;
       }
     };
@@ -3742,7 +3852,9 @@ bool unsubscribeToNotify(NimBLEClient* pClient) {
   return true;
 }
 
-bool subscribeToNotify(NimBLEAdvertisedDevice* advDeviceToUse) {
+// MIGRATION 2026-07: NimBLE-Arduino 2.5.0 scan callbacks pass const devices.
+// Old signature: bool subscribeToNotify(NimBLEAdvertisedDevice* advDeviceToUse)
+bool subscribeToNotify(const NimBLEAdvertisedDevice* advDeviceToUse) {
   NimBLEClient* pClient = NimBLEDevice::getClientByPeerAddress(advDeviceToUse->getAddress());
   NimBLERemoteService* pSvc = nullptr;
   NimBLERemoteCharacteristic* pChr = nullptr;
@@ -3766,7 +3878,9 @@ bool subscribeToNotify(NimBLEAdvertisedDevice* advDeviceToUse) {
   return true;
 }
 
-bool writeSettings(NimBLEAdvertisedDevice* advDeviceToUse) {
+// MIGRATION 2026-07: NimBLE-Arduino 2.5.0 scan callbacks pass const devices.
+// Old signature: bool writeSettings(NimBLEAdvertisedDevice* advDeviceToUse)
+bool writeSettings(const NimBLEAdvertisedDevice* advDeviceToUse) {
   NimBLEClient* pClient = NimBLEDevice::getClientByPeerAddress(advDeviceToUse->getAddress());
   NimBLERemoteService* pSvc = nullptr;
   NimBLERemoteCharacteristic* pChr = nullptr;
@@ -3831,7 +3945,9 @@ bool writeSettings(NimBLEAdvertisedDevice* advDeviceToUse) {
 
 
 /** Define a class to handle the callbacks when advertisments are received */
-class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
+// MIGRATION 2026-07: NimBLEAdvertisedDeviceCallbacks was replaced by NimBLEScanCallbacks.
+// Old base class: NimBLEAdvertisedDeviceCallbacks
+class AdvertisedDeviceCallbacks: public NimBLEScanCallbacks {
 
     void checkToContinueScan() {
       bool stopScan = false;
@@ -3875,7 +3991,10 @@ class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
 
       if (stopScan) {
         printAString("Stopping Scan found devices ... ");
-        NimBLEDevice::getScan()->stop();
+        // MIGRATION 2026-07: stop() no longer invokes onScanEnd(); dispatch the
+        // matching end handler explicitly to preserve the old callback behavior.
+        // Old code: NimBLEDevice::getScan()->stop();
+        stopScanAndDispatchEnd();
       }
       else {
 
@@ -3896,16 +4015,22 @@ class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
         if (!alwaysActiveScan && !onlyActiveScan) {
           if ( shouldActiveScan && !isActiveScan)   {
             isActiveScan = true;
-            NimBLEDevice::getScan()->stop();
+            // MIGRATION 2026-07: stop() no longer invokes onScanEnd().
+            // Old code: NimBLEDevice::getScan()->stop();
+            stopScanAndDispatchEnd();
           }
           else if (!shouldActiveScan && isActiveScan) {
             isActiveScan = false;
-            NimBLEDevice::getScan()->stop();
+            // MIGRATION 2026-07: stop() no longer invokes onScanEnd().
+            // Old code: NimBLEDevice::getScan()->stop();
+            stopScanAndDispatchEnd();
           }
         }
       }
     }
-    void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
+    // MIGRATION 2026-07: onResult() now receives const NimBLEAdvertisedDevice*.
+    // Old signature: void onResult(NimBLEAdvertisedDevice* advertisedDevice)
+    void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
       printAString("START onResult");
       printAString("Advertised Device found: ");
       printAString(advertisedDevice->toString().c_str());
@@ -3914,6 +4039,11 @@ class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
       }
       publishLastwillOnline();
       std::string advStr = advertisedDevice->getAddress().toString();
+      if (ignoredDevices.find(advStr) != ignoredDevices.end()) {
+        checkToContinueScan();
+        printAString("END onResult");
+        return;
+      }
       std::map<std::string, std::string>::iterator itS = allSwitchbotsOpp.find(advStr);
       bool gotAllStatus = false;
 
@@ -3925,7 +4055,9 @@ class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
         std::string deviceName = itS->second.c_str();
         if ((advertisedDevice->isAdvertisingService(NimBLEUUID("cba20d00-224d-11e6-9fb8-0002a5d5c51b"))) || isBotDevice(deviceName) || isCurtainDevice(deviceName) || isPlugDevice(deviceName) || isContactDevice(deviceName) || isMotionDevice(deviceName) || isMeterDevice(deviceName))
         {
-          std::map<std::string, NimBLEAdvertisedDevice*>::iterator itY;
+          // MIGRATION 2026-07: stored scan result pointers are const in NimBLE-Arduino 2.5.0.
+          // Old type: std::map<std::string, NimBLEAdvertisedDevice*>::iterator
+          std::map<std::string, const NimBLEAdvertisedDevice*>::iterator itY;
           itY = allSwitchbotsScanned.find(advStr);
           if (itY != allSwitchbotsScanned.end())
           {
@@ -4016,12 +4148,19 @@ class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
 
       }
       else {
-        NimBLEDevice::addIgnored(advStr);
+        // MIGRATION 2026-07: NimBLEDevice::addIgnored() was removed in NimBLE-Arduino 2.x.
+        // Old code: NimBLEDevice::addIgnored(advStr);
+        ignoredDevices[advStr] = true;
       }
       //waitForDeviceCreation = false;
 
       checkToContinueScan();
       printAString("END onResult");
+    };
+
+    // MIGRATION 2026-07: scan end callbacks are now delivered by NimBLEScanCallbacks.
+    void onScanEnd(const NimBLEScanResults& results, int reason) override {
+      dispatchScanEnded(results, reason);
     };
 
 
@@ -4113,7 +4252,11 @@ class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
     };
 };
 
-void initialScanEndedCB(NimBLEScanResults results) {
+// MIGRATION 2026-07: NimBLE-Arduino 2.5.0 onScanEnd passes const results and a reason.
+// Old signature: void initialScanEndedCB(NimBLEScanResults results)
+void initialScanEndedCB(const NimBLEScanResults& results, int reason) {
+  (void)results;
+  (void)reason;
   printAString("START initialScanEndedCB");
   //pScan->setFilterPolicy(BLE_HCI_SCAN_FILT_USE_WL);
   lastOnlinePublished = (((millis() - 60000) > 0) ? (millis() - 60000) : 0);
@@ -4140,7 +4283,11 @@ void initialScanEndedCB(NimBLEScanResults results) {
   printAString("END initialScanEndedCB");
 }
 
-void scanEndedCB(NimBLEScanResults results) {
+// MIGRATION 2026-07: NimBLE-Arduino 2.5.0 onScanEnd passes const results and a reason.
+// Old signature: void scanEndedCB(NimBLEScanResults results)
+void scanEndedCB(const NimBLEScanResults& results, int reason) {
+  (void)results;
+  (void)reason;
   printAString("START scanEndedCB");
   lastOnlinePublished = (((millis() - 60000) > 0) ? (millis() - 60000) : 0);
   yield();
@@ -4164,7 +4311,11 @@ void scanEndedCB(NimBLEScanResults results) {
   printAString("END scanEndedCB");
 }
 
-void rescanEndedCB(NimBLEScanResults results) {
+// MIGRATION 2026-07: NimBLE-Arduino 2.5.0 onScanEnd passes const results and a reason.
+// Old signature: void rescanEndedCB(NimBLEScanResults results)
+void rescanEndedCB(const NimBLEScanResults& results, int reason) {
+  (void)results;
+  (void)reason;
   printAString("START rescanEndedCB");
   lastOnlinePublished = (((millis() - 60000) > 0) ? (millis() - 60000) : 0);
   yield();
@@ -4190,7 +4341,11 @@ void rescanEndedCB(NimBLEScanResults results) {
   printAString("END rescanEndedCB");
 }
 
-void scanForeverEnded(NimBLEScanResults results) {
+// MIGRATION 2026-07: NimBLE-Arduino 2.5.0 onScanEnd passes const results and a reason.
+// Old signature: void scanForeverEnded(NimBLEScanResults results)
+void scanForeverEnded(const NimBLEScanResults& results, int reason) {
+  (void)results;
+  (void)reason;
   printAString("START scanForeverEnded");
   lastOnlinePublished = (((millis() - 60000) > 0) ? (millis() - 60000) : 0);
   yield();
@@ -4512,10 +4667,14 @@ void setup () {
   printAString("Starting NimBLE Client");
 
   NimBLEDevice::setSecurityAuth(/*BLE_SM_PAIR_AUTHREQ_BOND | BLE_SM_PAIR_AUTHREQ_MITM |*/ BLE_SM_PAIR_AUTHREQ_SC);
-  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  // MIGRATION 2026-07: NimBLE-Arduino 2.5.0 setPower() expects dBm, not ESP_PWR_LVL_*.
+  // Old code: NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  NimBLEDevice::setPower(9);
   //NimBLEDevice::setScanFilterMode(2);
   pScan = NimBLEDevice::getScan();
-  pScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks());
+  // MIGRATION 2026-07: setAdvertisedDeviceCallbacks() was replaced by setScanCallbacks().
+  // Old code: pScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks());
+  pScan->setScanCallbacks(new AdvertisedDeviceCallbacks());
   pScan->setInterval(70);
   pScan->setWindow(40);
   pScan->setDuplicateFilter(false);
@@ -4552,7 +4711,9 @@ void rescan(int seconds) {
   if (ledOnScan) {
     digitalWrite(LED_BUILTIN, ledONValue);
   }
-  pScan->start(seconds, rescanEndedCB, true);
+  // MIGRATION 2026-07: NimBLEScan::start() duration is milliseconds and no longer takes a callback.
+  // Old code: pScan->start(seconds, rescanEndedCB, true);
+  startScanSeconds(seconds, SCAN_END_RESCAN, true);
 }
 
 void scanForever() {
@@ -4580,7 +4741,9 @@ void scanForever() {
   if (ledOnScan) {
     digitalWrite(LED_BUILTIN, ledONValue);
   }
-  pScan->start(0, scanForeverEnded, true);
+  // MIGRATION 2026-07: NimBLEScan::start() no longer takes a callback.
+  // Old code: pScan->start(0, scanForeverEnded, true);
+  startScanSeconds(0, SCAN_END_FOREVER, true);
 }
 
 void rescanFind(std::string aMac) {
@@ -4604,7 +4767,9 @@ void rescanFind(std::string aMac) {
   pScan->setActiveScan(isActiveScan);
 
   allSwitchbotsScanned = {};
-  std::map<std::string, NimBLEAdvertisedDevice*>::iterator it = allSwitchbotsDev.begin();
+  // MIGRATION 2026-07: stored scan result pointers are const in NimBLE-Arduino 2.5.0.
+  // Old type: std::map<std::string, NimBLEAdvertisedDevice*>::iterator
+  std::map<std::string, const NimBLEAdvertisedDevice*>::iterator it = allSwitchbotsDev.begin();
   std::string anAddr;
 
   while (it != allSwitchbotsDev.end())
@@ -4623,7 +4788,9 @@ void rescanFind(std::string aMac) {
   if (ledOnScan) {
     digitalWrite(LED_BUILTIN, ledONValue);
   }
-  pScan->start(infoScanTime, scanEndedCB, true);
+  // MIGRATION 2026-07: NimBLEScan::start() duration is milliseconds and no longer takes a callback.
+  // Old code: pScan->start(infoScanTime, scanEndedCB, true);
+  startScanSeconds(infoScanTime, SCAN_END_SCAN, true);
 }
 
 void getAllBotSettings() {
@@ -4731,7 +4898,9 @@ void loop () {
     isActiveScan = true;
     pScan->setActiveScan(isActiveScan);
     delay(50);
-    pScan->start(initialScan, initialScanEndedCB, true);
+    // MIGRATION 2026-07: NimBLEScan::start() duration is milliseconds and no longer takes a callback.
+    // Old code: pScan->start(initialScan, initialScanEndedCB, true);
+    startScanSeconds(initialScan, SCAN_END_INITIAL, true);
   }
 
   if (initialScanComplete && client.isConnected() && !manualDebugStartESP32WithMQTT) {
@@ -5050,8 +5219,11 @@ void recurringScan() {
 bool processRequest(std::string macAdd, std::string aName, const char * command, std::string deviceTopic, bool disconnectAfter) {
   bool isSuccess = false;
   int count = 1;
-  std::map<std::string, NimBLEAdvertisedDevice*>::iterator itS = allSwitchbotsDev.find(macAdd);
-  NimBLEAdvertisedDevice* advDevice = nullptr;
+  // MIGRATION 2026-07: stored scan result pointers are const in NimBLE-Arduino 2.5.0.
+  // Old type: std::map<std::string, NimBLEAdvertisedDevice*>::iterator
+  std::map<std::string, const NimBLEAdvertisedDevice*>::iterator itS = allSwitchbotsDev.find(macAdd);
+  // Old type: NimBLEAdvertisedDevice*
+  const NimBLEAdvertisedDevice* advDevice = nullptr;
   if (itS != allSwitchbotsDev.end())
   {
     advDevice =  itS->second;
@@ -5089,7 +5261,7 @@ bool processRequest(std::string macAdd, std::string aName, const char * command,
   }
   if (advDevice == nullptr)
   {
-    StaticJsonDocument<100> doc;
+    JsonDocument doc;
     char aBuffer[100];
     doc["id"] = aName.c_str();
     doc["status"] = "errorLocatingDevice";
@@ -5337,8 +5509,10 @@ bool processQueue() {
                 std::string anAddr = itN->second;
                 std::transform(anAddr.begin(), anAddr.end(), anAddr.begin(), to_lower());
                 NimBLEClient* pClient = nullptr;
-                if (NimBLEDevice::getClientListSize()) {
-                  pClient = NimBLEDevice::getClientByPeerAddress(anAddr);
+                // MIGRATION 2026-07: getClientListSize() was replaced by getCreatedClientCount().
+                // Old code: if (NimBLEDevice::getClientListSize()) {
+                if (NimBLEDevice::getCreatedClientCount()) {
+                  pClient = NimBLEDevice::getClientByPeerAddress(configuredSwitchBotAddress(anAddr));
                   if (pClient) {
                     if (pClient->isConnected()) {
                       unsubscribeToNotify(pClient);
@@ -5401,8 +5575,10 @@ bool processQueue() {
                 std::string anAddr = itN->second;
                 std::transform(anAddr.begin(), anAddr.end(), anAddr.begin(), to_lower());
                 NimBLEClient* pClient = nullptr;
-                if (NimBLEDevice::getClientListSize()) {
-                  pClient = NimBLEDevice::getClientByPeerAddress(anAddr);
+                // MIGRATION 2026-07: getClientListSize() was replaced by getCreatedClientCount().
+                // Old code: if (NimBLEDevice::getClientListSize()) {
+                if (NimBLEDevice::getCreatedClientCount()) {
+                  pClient = NimBLEDevice::getClientByPeerAddress(configuredSwitchBotAddress(anAddr));
                   if (pClient) {
                     if (pClient->isConnected()) {
                       unsubscribeToNotify(pClient);
@@ -5459,8 +5635,10 @@ bool processQueue() {
                 anAddr = itN->second;
                 std::transform(anAddr.begin(), anAddr.end(), anAddr.begin(), to_lower());
                 NimBLEClient* pClient = nullptr;
-                if (NimBLEDevice::getClientListSize()) {
-                  pClient = NimBLEDevice::getClientByPeerAddress(anAddr);
+                // MIGRATION 2026-07: getClientListSize() was replaced by getCreatedClientCount().
+                // Old code: if (NimBLEDevice::getClientListSize()) {
+                if (NimBLEDevice::getCreatedClientCount()) {
+                  pClient = NimBLEDevice::getClientByPeerAddress(configuredSwitchBotAddress(anAddr));
                   if (pClient) {
                     if (pClient->isConnected()) {
                       unsubscribeToNotify(pClient);
@@ -5569,9 +5747,12 @@ bool processQueue() {
   return true;
 }
 
-bool sendToDevice(NimBLEAdvertisedDevice * advDevice, std::string & aName, const char * command, std::string & deviceTopic, bool disconnectAfter) {
+// MIGRATION 2026-07: NimBLE-Arduino 2.5.0 scan callbacks pass const devices.
+// Old signature: bool sendToDevice(NimBLEAdvertisedDevice * advDevice, ...)
+bool sendToDevice(const NimBLEAdvertisedDevice * advDevice, std::string & aName, const char * command, std::string & deviceTopic, bool disconnectAfter) {
   bool isSuccess = false;
-  NimBLEAdvertisedDevice* advDeviceToUse = advDevice;
+  // Old type: NimBLEAdvertisedDevice*
+  const NimBLEAdvertisedDevice* advDeviceToUse = advDevice;
   std::string addr = advDeviceToUse->getAddress().toString();
   //std::transform(addr.begin(), addr.end(), addr.begin(), ::toupper);
   addr = addr.c_str();
@@ -5581,7 +5762,7 @@ bool sendToDevice(NimBLEAdvertisedDevice * advDevice, std::string & aName, const
   if ((advDeviceToUse != nullptr) && (advDeviceToUse != NULL))
   {
     char aBuffer[100];
-    StaticJsonDocument<100> doc;
+    JsonDocument doc;
     //    doc["id"] = aName.c_str();
     if (strcmp(command, "requestInfo") == 0 || strcmp(command, "REQUESTINFO") == 0 || strcmp(command, "GETINFO") == 0) {
       isSuccess = requestInfo(advDeviceToUse);
@@ -5632,7 +5813,7 @@ bool sendToDevice(NimBLEAdvertisedDevice * advDevice, std::string & aName, const
           delay(100);
           shouldContinue = false;
           if (!lastCommandSentPublished) {
-            StaticJsonDocument<100> doc;
+            JsonDocument doc;
             char aBuffer[100];
             doc["status"] = "commandSent";
             doc["command"] = command;
@@ -5667,7 +5848,7 @@ bool sendToDevice(NimBLEAdvertisedDevice * advDevice, std::string & aName, const
               }
               if (isCurtainDevice(aDevice)) {
                 std::string devicePosTopic = deviceTopic + "/position";
-                StaticJsonDocument<50> docPos;
+                JsonDocument docPos;
                 char aBuffer[100];
                 docPos["pos"] = aVal;
                 serializeJson(docPos, aBuffer);
@@ -5787,8 +5968,10 @@ bool controlMQTT(std::string & device, std::string payload, bool disconnectAfter
   if (lastDeviceControlled != "") {
     if (diffDevice) {
       NimBLEClient* pClient = nullptr;
-      if (NimBLEDevice::getClientListSize()) {
-        pClient = NimBLEDevice::getClientByPeerAddress(lastDeviceControlled);
+      // MIGRATION 2026-07: getClientListSize() was replaced by getCreatedClientCount().
+      // Old code: if (NimBLEDevice::getClientListSize()) {
+      if (NimBLEDevice::getCreatedClientCount()) {
+        pClient = NimBLEDevice::getClientByPeerAddress(configuredSwitchBotAddress(lastDeviceControlled));
         if (pClient) {
           if (pClient->isConnected()) {
             unsubscribeToNotify(pClient);
@@ -5827,7 +6010,7 @@ bool controlMQTT(std::string & device, std::string payload, bool disconnectAfter
       }
       else {
         char aBuffer[100];
-        StaticJsonDocument<100> docOut;
+        JsonDocument docOut;
         docOut["status"] = "errorJSONValue";
         serializeJson(docOut, aBuffer);
         printAString("Parsing failed = value not a valid command");
@@ -5837,7 +6020,7 @@ bool controlMQTT(std::string & device, std::string payload, bool disconnectAfter
   }
   else {
     char aBuffer[100];
-    StaticJsonDocument<100> docOut;
+    JsonDocument docOut;
     docOut["status"] = "errorJSONDevice";
     serializeJson(docOut, aBuffer);
     printAString("Parsing failed = device not from list");
@@ -5886,13 +6069,15 @@ void rescanMQTT(std::string & payload) {
   isRescanning = true;
   processing = true;
   printAString("Processing Rescan MQTT...");
-  StaticJsonDocument<100> docIn;
-  deserializeJson(docIn, payload);
+  JsonDocument docIn;
+  // MIGRATION 2026-07: ArduinoJson 7 returns DeserializationError from deserializeJson().
+  // Old code: deserializeJson(docIn, payload); if (docIn == nullptr) { ... }
+  DeserializationError error = deserializeJson(docIn, payload);
 
-  if (docIn == nullptr) { //Check for errors in parsing
+  if (error) { //Check for errors in parsing
     printAString("Parsing failed");
     char aBuffer[100];
-    StaticJsonDocument<100> docOut;
+    JsonDocument docOut;
     docOut["status"] = "errorParsingJSON";
     serializeJson(docOut, aBuffer);
     addToPublish(ESPMQTTTopic.c_str(), aBuffer);
@@ -5915,7 +6100,7 @@ void rescanMQTT(std::string & payload) {
       }
       else {
         char aBuffer[100];
-        StaticJsonDocument<100> docOut;
+        JsonDocument docOut;
         docOut["status"] = "errorJSONValue";
         serializeJson(docOut, aBuffer);
         printAString("Parsing failed = device not from list");
@@ -5929,13 +6114,15 @@ void rescanMQTT(std::string & payload) {
 void requestInfoMQTT(std::string & payload) {
   processing = true;
   printAString("Processing Request Info MQTT...");
-  StaticJsonDocument<100> docIn;
-  deserializeJson(docIn, payload);
+  JsonDocument docIn;
+  // MIGRATION 2026-07: ArduinoJson 7 returns DeserializationError from deserializeJson().
+  // Old code: deserializeJson(docIn, payload); if (docIn == nullptr) { ... }
+  DeserializationError error = deserializeJson(docIn, payload);
 
-  if (docIn == nullptr) { //Check for errors in parsing
+  if (error) { //Check for errors in parsing
     printAString("Parsing failed");
     char aBuffer[100];
-    StaticJsonDocument<100> docOut;
+    JsonDocument docOut;
     docOut["status"] = "errorParsingJSON";
     serializeJson(docOut, aBuffer);
     addToPublish(ESPMQTTTopic.c_str(), aBuffer);
@@ -6005,7 +6192,7 @@ void requestInfoMQTT(std::string & payload) {
     }
     else {
       char aBuffer[100];
-      StaticJsonDocument<100> docOut;
+      JsonDocument docOut;
       docOut["status"] = "errorJSONId";
       serializeJson(docOut, aBuffer);
       printAString("Parsing failed = device not from list");
@@ -6088,7 +6275,7 @@ void onConnectionEstablished() {
         client.subscribe((botTopic + aDevice + "/settings").c_str(), [aDevice] (const String & payload)  {
           if ((payload != NULL) && !(payload.isEmpty())) {
             printAString("settings MQTT Received (from retained)...updating firmware/timers/hold");
-            StaticJsonDocument<100> docIn;
+            JsonDocument docIn;
             if (isBotDevice(aDevice)) {
               printAString("going thru bot settings retained");
               std::map<std::string, std::string>::iterator itP = allBots.find(aDevice);
@@ -6133,7 +6320,7 @@ void onConnectionEstablished() {
           printAString("Control MQTT Received...");
           if (pScan->isScanning() || isRescanning) {
             if (pScan->isScanning()) {
-              pScan->stop();
+              stopScanAndDispatchEnd();
             }
             allSwitchbotsScanned = {};
             forceRescan = true;
@@ -6165,7 +6352,7 @@ void onConnectionEstablished() {
                   else if (aVal > 100) {
                     aVal = 100;
                   }
-                  StaticJsonDocument<50> docPos;
+                  JsonDocument docPos;
                   char aBuffer[100];
                   docPos["pos"] = aVal;
                   serializeJson(docPos, aBuffer);
@@ -6226,7 +6413,7 @@ void onConnectionEstablished() {
           else {
             if (pScan->isScanning() || isRescanning) {
               if (pScan->isScanning()) {
-                pScan->stop();
+                stopScanAndDispatchEnd();
               }
               allSwitchbotsScanned = {};
               forceRescan = true;
@@ -6316,7 +6503,7 @@ void onConnectionEstablished() {
 
           if (pScan->isScanning() || isRescanning) {
             if (pScan->isScanning()) {
-              pScan->stop();
+              stopScanAndDispatchEnd();
             }
             allSwitchbotsScanned = {};
             forceRescan = true;
@@ -6367,7 +6554,7 @@ void onConnectionEstablished() {
           if (isRescanning) {
             if (pScan->isScanning() || isRescanning) {
               if (pScan->isScanning()) {
-                pScan->stop();
+                stopScanAndDispatchEnd();
               }
               allSwitchbotsScanned = {};
               forceRescan = true;
@@ -6410,7 +6597,7 @@ void onConnectionEstablished() {
           if (isRescanning) {
             if (pScan->isScanning() || isRescanning) {
               if (pScan->isScanning()) {
-                pScan->stop();
+                stopScanAndDispatchEnd();
               }
               allSwitchbotsScanned = {};
               forceRescan = true;
@@ -7210,7 +7397,7 @@ void onConnectionEstablished() {
           if (isRescanning) {
             if (pScan->isScanning() || isRescanning) {
               if (pScan->isScanning()) {
-                pScan->stop();
+                stopScanAndDispatchEnd();
               }
               allSwitchbotsScanned = {};
               forceRescan = true;
@@ -7582,7 +7769,7 @@ void onConnectionEstablished() {
         if (isRescanning) {
           if (pScan->isScanning() || isRescanning) {
             if (pScan->isScanning()) {
-              pScan->stop();
+              stopScanAndDispatchEnd();
             }
             allSwitchbotsScanned = {};
             forceRescan = true;
@@ -7611,7 +7798,7 @@ void onConnectionEstablished() {
       if ((payload != NULL) && !(payload.isEmpty())) {
         printAString("Request Settings MQTT Received...");
         if (!commandQueue.isFull()) {
-          StaticJsonDocument<100> docIn;
+          JsonDocument docIn;
           deserializeJson(docIn, payload.c_str());
           const char * aDevice = docIn["id"];
           struct QueueCommand queueCommand;
@@ -7633,7 +7820,7 @@ void onConnectionEstablished() {
       if ((payload != NULL) && !(payload.isEmpty())) {
         printAString("setMode  MQTT Received...");
         if (!commandQueue.isFull()) {
-          StaticJsonDocument<100> docIn;
+          JsonDocument docIn;
           deserializeJson(docIn, payload.c_str());
           const char * aDevice = docIn["id"];
           const char * aMode = docIn["mode"];
@@ -7656,7 +7843,7 @@ void onConnectionEstablished() {
       if ((payload != NULL) && !(payload.isEmpty())) {
         printAString("setHold MQTT Received...");
         if (!commandQueue.isFull()) {
-          StaticJsonDocument<100> docIn;
+          JsonDocument docIn;
           deserializeJson(docIn, payload.c_str());
           const char * aDevice = docIn["id"];
           int aHold = docIn["hold"];
@@ -7680,7 +7867,7 @@ void onConnectionEstablished() {
       if ((payload != NULL) && !(payload.isEmpty())) {
         printAString("holdPress MQTT Received...");
         if (!commandQueue.isFull()) {
-          StaticJsonDocument<100> docIn;
+          JsonDocument docIn;
           deserializeJson(docIn, payload.c_str());
           const char * aDevice = docIn["id"];
           int aHold = docIn["hold"];
@@ -7700,7 +7887,7 @@ void onConnectionEstablished() {
         if (isRescanning) {
           if (pScan->isScanning() || isRescanning) {
             if (pScan->isScanning()) {
-              pScan->stop();
+              stopScanAndDispatchEnd();
             }
             allSwitchbotsScanned = {};
             forceRescan = true;
@@ -7731,10 +7918,14 @@ void onConnectionEstablished() {
   }
 }
 
-bool connectToServer(NimBLEAdvertisedDevice * advDeviceToUse) {
+// MIGRATION 2026-07: NimBLE-Arduino 2.5.0 scan callbacks pass const devices.
+// Old signature: bool connectToServer(NimBLEAdvertisedDevice * advDeviceToUse)
+bool connectToServer(const NimBLEAdvertisedDevice * advDeviceToUse) {
   printAString("Try to connect. Try a reconnect first...");
   NimBLEClient* pClient = nullptr;
-  if (NimBLEDevice::getClientListSize()) {
+  // MIGRATION 2026-07: getClientListSize() was replaced by getCreatedClientCount().
+  // Old code: if (NimBLEDevice::getClientListSize()) {
+  if (NimBLEDevice::getCreatedClientCount()) {
 
     pClient = NimBLEDevice::getClientByPeerAddress(advDeviceToUse->getAddress());
     if (pClient) {
@@ -7750,7 +7941,9 @@ bool connectToServer(NimBLEAdvertisedDevice * advDeviceToUse) {
     }
   }
   if (!pClient) {
-    if (NimBLEDevice::getClientListSize() >= NIMBLE_MAX_CONNECTIONS) {
+    // MIGRATION 2026-07: getClientListSize() was replaced by getCreatedClientCount().
+    // Old code: if (NimBLEDevice::getClientListSize() >= NIMBLE_MAX_CONNECTIONS) {
+    if (NimBLEDevice::getCreatedClientCount() >= NIMBLE_MAX_CONNECTIONS) {
       printAString("Max clients reached - no more connections available");
       return false;
     }
@@ -7865,7 +8058,9 @@ bool isMotionDevice(std::string & aDevice) {
   return false;
 }
 
-bool sendCommand(NimBLEAdvertisedDevice * advDeviceToUse, const char * type, int attempts, bool disconnectAfter) {
+// MIGRATION 2026-07: NimBLE-Arduino 2.5.0 scan callbacks pass const devices.
+// Old signature: bool sendCommand(NimBLEAdvertisedDevice * advDeviceToUse, ...)
+bool sendCommand(const NimBLEAdvertisedDevice * advDeviceToUse, const char * type, int attempts, bool disconnectAfter) {
   if (advDeviceToUse == nullptr) {
     return false;
   }
@@ -7892,10 +8087,12 @@ bool sendCommand(NimBLEAdvertisedDevice * advDeviceToUse, const char * type, int
   byte bArrayBotModePass[] = {0x57, 0x13, NULL, NULL, NULL, NULL, 0x64, NULL};       // The proper array to use for setting mode with password (firmware 4.9)
 
   std::string anAddr = advDeviceToUse->getAddress();
-  if (!NimBLEDevice::getClientListSize()) {
+  // MIGRATION 2026-07: getClientListSize() was replaced by getCreatedClientCount().
+  // Old code: if (!NimBLEDevice::getClientListSize()) {
+  if (!NimBLEDevice::getCreatedClientCount()) {
     return false;
   }
-  NimBLEClient* pClient = NimBLEDevice::getClientByPeerAddress(anAddr);
+  NimBLEClient* pClient = NimBLEDevice::getClientByPeerAddress(configuredSwitchBotAddress(anAddr));
   if (!pClient) {
     return false;
   }
@@ -7911,7 +8108,7 @@ bool sendCommand(NimBLEAdvertisedDevice * advDeviceToUse, const char * type, int
     printAString("Attempt to send command. Not connecting. Try connecting...");
     tryConnect = !(connectToServer(advDeviceToUse));
     if (!tryConnect) {
-      pClient = NimBLEDevice::getClientByPeerAddress(anAddr);
+      pClient = NimBLEDevice::getClientByPeerAddress(configuredSwitchBotAddress(anAddr));
     }
   }
   bool returnValue = true;
@@ -8244,7 +8441,9 @@ bool sendCommand(NimBLEAdvertisedDevice * advDeviceToUse, const char * type, int
   return true;
 }
 
-bool getGeneric(NimBLEAdvertisedDevice * advDeviceToUse) {
+// MIGRATION 2026-07: NimBLE-Arduino 2.5.0 scan callbacks pass const devices.
+// Old signature: bool getGeneric(NimBLEAdvertisedDevice * advDeviceToUse)
+bool getGeneric(const NimBLEAdvertisedDevice * advDeviceToUse) {
   NimBLEClient* pClient = NimBLEDevice::getClientByPeerAddress(advDeviceToUse->getAddress());
   NimBLERemoteService* pSvc = nullptr;
   NimBLERemoteCharacteristic* pChr = nullptr;;
@@ -8267,7 +8466,9 @@ bool getGeneric(NimBLEAdvertisedDevice * advDeviceToUse) {
   return false;
 }
 
-bool requestInfo(NimBLEAdvertisedDevice * advDeviceToUse) {
+// MIGRATION 2026-07: NimBLE-Arduino 2.5.0 scan callbacks pass const devices.
+// Old signature: bool requestInfo(NimBLEAdvertisedDevice * advDeviceToUse)
+bool requestInfo(const NimBLEAdvertisedDevice * advDeviceToUse) {
   if (advDeviceToUse == nullptr) {
     return false;
   }
@@ -8322,7 +8523,7 @@ void notifyCB(NimBLERemoteCharacteristic * pRemoteCharacteristic, uint8_t* pData
     std::string deviceAssumedStateTopic = botTopic + aDevice + "/assumedstate";
 
     if (!lastCommandSentPublished) {
-      StaticJsonDocument<60> statDoc;
+      JsonDocument statDoc;
       statDoc["status"] = "commandSent";
       statDoc["command"] = aCommand;
       serializeJson(statDoc, aBuffer);
@@ -8331,7 +8532,7 @@ void notifyCB(NimBLERemoteCharacteristic * pRemoteCharacteristic, uint8_t* pData
     }
 
     if (length == 1) {
-      StaticJsonDocument<100> statDoc;
+      JsonDocument statDoc;
       uint8_t byte1 = pData[0];
       printAString("The response value from bot set mode or holdSecs: ");
       printAString(byte1);
@@ -8361,7 +8562,7 @@ void notifyCB(NimBLERemoteCharacteristic * pRemoteCharacteristic, uint8_t* pData
       client.publish(deviceStatusTopic.c_str(), aBuffer);
     }
     if (length == 3) {
-      StaticJsonDocument<60> statDoc;
+      JsonDocument statDoc;
       uint8_t byte1 = pData[0];
       printAString("The response value from bot action: ");
       printAString(byte1);
@@ -8411,7 +8612,7 @@ void notifyCB(NimBLERemoteCharacteristic * pRemoteCharacteristic, uint8_t* pData
       client.publish(deviceStatusTopic.c_str(), aBuffer);
     }
     else if (length == 13) {
-      StaticJsonDocument<50> statDoc;
+      JsonDocument statDoc;
       statDoc["status"] = "success";
       statDoc["command"] = aCommand;
       lastCommandWasBusy = false;
@@ -8420,7 +8621,7 @@ void notifyCB(NimBLERemoteCharacteristic * pRemoteCharacteristic, uint8_t* pData
 
       /**** THESE SETTINGS ARE ALSO COLLECTED BY A SCAN SO IT IS REDUNDANT. Commented out because of RSSI. The rest works****/
       /*
-            StaticJsonDocument<100> attDoc;
+            JsonDocument attDoc;
             std::map<std::string, NimBLEAdvertisedDevice*>::iterator itS = allSwitchbotsDev.find(deviceMac);
             NimBLEAdvertisedDevice* advDevice = nullptr;
             if (itS != allSwitchbotsDev.end())
@@ -8457,7 +8658,7 @@ void notifyCB(NimBLERemoteCharacteristic * pRemoteCharacteristic, uint8_t* pData
             addToPublish(deviceAttrTopic.c_str(), aBuffer, true);
             addToPublish(deviceStateTopic.c_str(), aState.c_str(), true);*/
       /***************************************/
-      StaticJsonDocument<100> settDoc;
+      JsonDocument settDoc;
       float fwVersion = pData[2] / 10.0;
       settDoc["firmware"] = serialized(String(fwVersion, 1));
       int timersNumber = pData[8];
@@ -8483,7 +8684,7 @@ void notifyCB(NimBLERemoteCharacteristic * pRemoteCharacteristic, uint8_t* pData
     deviceAttrTopic = curtainTopic + aDevice + "/attributes";
 
     if (!lastCommandSentPublished) {
-      StaticJsonDocument<50> statDoc;
+      JsonDocument statDoc;
       statDoc["status"] = "commandSent";
       statDoc["command"] = aCommand;
       serializeJson(statDoc, aBuffer);
@@ -8494,7 +8695,7 @@ void notifyCB(NimBLERemoteCharacteristic * pRemoteCharacteristic, uint8_t* pData
       return;
     }
     else if (length == 3) {
-      StaticJsonDocument<50> statDoc;
+      JsonDocument statDoc;
       uint8_t byte1 = pData[0];
 
       printAString("The response value from curtain: ");
@@ -8532,7 +8733,7 @@ void notifyCB(NimBLERemoteCharacteristic * pRemoteCharacteristic, uint8_t* pData
     deviceAttrTopic = plugTopic + aDevice + "/attributes";
 
     if (!lastCommandSentPublished) {
-      StaticJsonDocument<50> statDoc;
+      JsonDocument statDoc;
       statDoc["status"] = "commandSent";
       statDoc["command"] = aCommand;
       serializeJson(statDoc, aBuffer);
@@ -8545,7 +8746,7 @@ void notifyCB(NimBLERemoteCharacteristic * pRemoteCharacteristic, uint8_t* pData
     else if (length == 2) {
       Serial.println("length:");
       Serial.println(length);
-      StaticJsonDocument<50> statDoc;
+      JsonDocument statDoc;
       uint8_t byte1 = pData[0];
 
       printAString("The response value from plug: ");
