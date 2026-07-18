@@ -792,6 +792,7 @@ static std::map<std::string, bool> discoveredDevices = {};
 // MIGRATION 2026-07: NimBLEDevice::addIgnored() was removed in NimBLE-Arduino 2.x.
 // Keep the old behavior locally for unknown BLE addresses.
 static std::map<std::string, bool> ignoredDevices = {};
+static const size_t maxIgnoredDevices = 100;
 static std::map<std::string, bool> botsInPressMode = {};
 static std::map<std::string, bool> botsToWaitFor = {};
 static std::map<std::string, int> botHoldSecs = {};
@@ -4150,7 +4151,9 @@ class AdvertisedDeviceCallbacks: public NimBLEScanCallbacks {
       else {
         // MIGRATION 2026-07: NimBLEDevice::addIgnored() was removed in NimBLE-Arduino 2.x.
         // Old code: NimBLEDevice::addIgnored(advStr);
-        ignoredDevices[advStr] = true;
+        if (ignoredDevices.size() < maxIgnoredDevices) {
+          ignoredDevices[advStr] = true;
+        }
       }
       //waitForDeviceCreation = false;
 
